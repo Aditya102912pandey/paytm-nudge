@@ -1,42 +1,136 @@
 # streamlit_app.py
 import streamlit as st
+import pandas as pd
 import sqlite3
 import math
 import random
 from datetime import datetime, timedelta, timezone
 
-st.set_page_config(page_title="Paytm Nudge Engine", page_icon="⚡", layout="centered")
+st.set_page_config(page_title="Paytm Nudge Engine", page_icon="⚡", layout="wide")
 
-# --- 1. In-Memory Database Initialization ---
-@st.cache_resource
-def init_database():
-    conn = sqlite3.connect(":memory:", check_same_thread=False)
-    cursor = conn.cursor()
-    cursor.execute("""
-    CREATE TABLE merchants (
-        store_id TEXT PRIMARY KEY,
-        name TEXT,
-        lat REAL,
-        lon REAL,
-        store_aov REAL,
-        margin_cap REAL,
-        remaining_budget REAL
-    )
-    """)
-    # Seed Gupta General Store (AOV: ₹200, Margin Cap: 15%, Budget: ₹1500)
-    cursor.execute("INSERT INTO merchants VALUES ('store_gupta_01', 'Gupta General Store', 28.6315, 77.2167, 200.0, 0.15, 1500.0)")
-    conn.commit()
-    return conn
+# --- 1. Store Baseline Configuration ---
+STORE_CONFIG = {
+    "store_id": "store_gupta_01",
+    "name": "Gupta Kirana & General Store",
+    "lat": 28.6315,
+    "lon": 77.2167,
+    "aov": 200.0,
+    "margin_cap": 0.15,
+    "budget": 1500.0
+}
 
-conn = init_database()
+# --- 2. Synthetic Real-World UPI Data Generators ---
+def generate_sample_statement(profile_type: str) -> pd.DataFrame:
+    now = datetime.now(timezone.utc)
+    records = []
+    
+    if profile_type == "Frequent Morning Buyer":
+        # 18-24 morning visits in last 30 days
+        for i in range(1, 22):
+            txn_time = now - timedelta(days=i, hours=random.randint(1, 3))
+            records.append({
+                "txn_id": f"UPI-{random.randint(100000, 999999)}",
+                "timestamp": txn_time.strftime("%Y-%m-%d %H:%M:%S"),
+                "store_id": STORE_CONFIG["store_id"],
+                "merchant_name": STORE_CONFIG["name"],
+                "amount": round(random.uniform(40.0, 110.0), 2),
+                "channel": "UPI Soundbox / QR"
+            })
+    elif profile_type == "Lapsed Customer":
+        # Transactions are 30-50 days old
+        for d in [32, 38, 45]:
+            txn_time = now - timedelta(days=d)
+            records.append({
+                "txn_id": f"UPI-{random.randint(100000, 999999)}",
+                "timestamp": txn_time.strftime("%Y-%m-%d %H:%M:%S"),
+                "store_id": STORE_CONFIG["store_id"],
+                "merchant_name": STORE_CONFIG["name"],
+                "amount": round(random.uniform(150.0, 350.0), 2),
+                "channel": "UPI Soundbox / QR"
+            })
+    elif profile_type == "Occasional Evening Shopper":
+        # 2-3 visits spaced out
+        for d in [4, 18]:
+            txn_time = now - timedelta(days=d, hours=random.randint(8, 11))
+            records.append({
+                "txn_id": f"UPI-{random.randint(100000, 999999)}",
+                "timestamp": txn_time.strftime("%Y-%m-%d %H:%M:%S"),
+                "store_id": STORE_CONFIG["store_id"],
+                "merchant_name": STORE_CONFIG["name"],
+                "amount": round(random.uniform(180.0, 260.0), 2),
+                "channel": "UPI Soundbox / QR"
+            })
+    else:  # New User
+        # Empty payment record with this merchant
+        pass
 
-# --- 2. Core Decision Engine Logic (5-Gate Pipeline) ---
-def run_engine(visits_30d: int, days_since: int, distance_km: float):
-    cursor = conn.cursor()
-    cursor.execute("SELECT store_aov, margin_cap, remaining_budget FROM merchants WHERE store_id = 'store_gupta_01'")
-    store_aov, margin_cap, budget = cursor.fetchone()
+    return pd.DataFrame(records)
 
-    # Gate 1: Geofence Check (1.0 km radius)
+# --- 3. AI Behavioral Parsing Agent ---
+def ai_parse_transactions(df: pd.DataFrame, target_store_id: str):
+    """
+    Parses unlabelled raw payment history to extract behavioral signals.
+    """
+    if df.empty or "timestamp" not in df.columns:
+        return {
+            "visits_30d": 0,
+            "days_since_last": None,
+            "regularity": 0.0,
+            "avg_spend": 0.0,
+            "ai_summary": "Zero past footprint found at this store. Profile matches a fresh market prospect."
+        }
+
+    # Filter transactions for this store
+    store_txns = df[df["store_id"] == target_store_id].copy()
+    if store_txns.empty:
+        return {
+            "visits_30d": 0,
+            "days_since_last": None,
+            "regularity": 0.0,
+            "avg_spend": 0.0,
+            "ai_summary": "Active UPI user elsewhere, but zero relationship footprint with this merchant."
+        }
+
+    store_txns["dt"] = pd.to_datetime(store_txns["timestamp"])
+    now = datetime.now(timezone.utc)
+    
+    # Recency
+    store_txns = store_txns.sort_values(by="dt", ascending=False)
+    latest_visit = store_txns["dt"].iloc[0].tz_localize(timezone.utc) if store_txns["dt"].iloc[0].tzinfo is None else store_txns["dt"].iloc[0]
+    days_since_last = (now - latest_visit).days
+
+    # Frequency (last 30 days)
+    txns_30d = store_txns[store_txns["dt"].apply(lambda d: (now - (d.tz_localize(timezone.utc) if d.tzinfo is None else d)).days <= 30)]
+    visits_30d = len(txns_30d)
+
+    # Regularity (standard deviation of transaction hour)
+    hours = store_txns["dt"].dt.hour.tolist()
+    if len(hours) >= 4:
+        hour_variance = pd.Series(hours).std()
+        regularity = round(max(0.0, 1.0 - (hour_variance / 6.0)), 2)
+    else:
+        regularity = 0.20
+
+    avg_spend = round(store_txns["amount"].mean(), 2)
+
+    # Narrative explanation generated by the engine
+    ai_summary = f"Detected {visits_30d} visits over the last 30 days. Last activity was {days_since_last} days ago. Typical ticket: ₹{avg_spend}."
+
+    return {
+        "visits_30d": visits_30d,
+        "days_since_last": days_since_last,
+        "regularity": regularity,
+        "avg_spend": avg_spend,
+        "ai_summary": ai_summary
+    }
+
+# --- 4. 5-Gate Coupon Decision Logic ---
+def run_coupon_decision(signals: dict, distance_km: float):
+    store_aov = STORE_CONFIG["aov"]
+    margin_cap = STORE_CONFIG["margin_cap"]
+    budget = STORE_CONFIG["budget"]
+
+    # Gate 1: Geofence
     if distance_km > 1.0:
         return {
             "issue": False,
@@ -44,39 +138,42 @@ def run_engine(visits_30d: int, days_since: int, distance_km: float):
             "val": 0.0,
             "min_basket": 0.0,
             "habit_score": 0.0,
-            "reason": f"Customer is {distance_km:.2f} km away (store geofence limit: 1.0 km)"
+            "reason": f"Customer located {distance_km:.2f} km away. Geofence suppress limit: 1.0 km."
         }
 
-    # Gate 2 & 3: Relationship Classification
-    if visits_30d >= 8:
-        segment = "Habitual"
+    visits = signals["visits_30d"]
+    days_since = signals["days_since_last"]
+
+    # Gate 2 & 3: Segment classification & Habit Gate
+    if visits >= 8 or signals["regularity"] >= 0.85:
+        segment = "Habitual (Regular)"
         return {
             "issue": False,
             "segment": segment,
             "val": 0.0,
             "min_basket": 0.0,
             "habit_score": 1.0,
-            "reason": f"Suppressed: Customer has strong organic habit ({visits_30d} visits in last 30 days)"
+            "reason": f"Suppressed: Customer exhibits strong organic habit ({visits} visits in last 30d). Discount will leak margin without incrementality."
         }
-    elif days_since == 999:  # Convention for brand-new customer
-        segment = "New"
+    elif days_since is None:
+        segment = "New Prospect"
         val = 25.0
         min_basket = store_aov
         habit_score = 0.0
     elif days_since >= 21:
-        segment = "Lapsed"
+        segment = "Lapsed (Churn Risk)"
         val = 18.0
         min_basket = store_aov
-        habit_score = 0.10
+        habit_score = 0.15
     else:
         segment = "Occasional"
-        norm_freq = min(visits_30d / 12.0, 1.0)
+        norm_freq = min(visits / 12.0, 1.0)
         norm_rec = max(0.0, 1.0 - (days_since / 30.0))
-        habit_score = round(0.5 * norm_freq + 0.5 * norm_rec, 2)
+        habit_score = round(0.5 * norm_freq + 0.3 * signals["regularity"] + 0.2 * norm_rec, 2)
         val = round(25.0 * (1.0 - habit_score), 0)
         min_basket = round(store_aov * 1.35, 0)
 
-    # Gate 4 & 5: Margin Guardrail & Budget Protection
+    # Margin guardrail
     max_discount = store_aov * margin_cap
     final_val = min(val, max_discount, budget)
 
@@ -86,165 +183,87 @@ def run_engine(visits_30d: int, days_since: int, distance_km: float):
         "val": round(final_val, 0),
         "min_basket": round(min_basket, 0),
         "habit_score": habit_score,
-        "reason": f"Targeted incentive issued for {segment} shopper"
+        "reason": f"Targeted offer generated for {segment}. Dynamic spend requirement enforces positive merchant ROI."
     }
 
-# --- 3. Streamlit User Interface ---
-st.title("⚡ Paytm Nudge: Smart Coupon Engine")
-st.caption("Don't pay for habits. Pay only for the customers you win.")
+# --- 5. Streamlit App Interface ---
+st.title("⚡ Paytm Nudge: AI Transaction-Aware Coupon Engine")
+st.caption("Real-Time Behavioral Analysis from Raw UPI Statement History")
 
-tab1, tab2, tab3 = st.tabs(["👥 Pre-built Personas", "🎛️ Test Custom Customer", "📊 1,000 Customer Simulator"])
+col_left, col_right = st.columns([1, 1.2])
 
-# --- TAB 1: STORY PERSONAS ---
-with tab1:
-    st.subheader("Step 1: Evaluate Real-World Shoppers")
-    persona = st.selectbox(
-        "Choose a Story Persona to Test:",
-        [
-            "🥛 Ramesh Uncle (Daily Morning Regular - 22 visits)",
-            "🚶 Priya (New Resident to Area - 0 visits)",
-            "😴 Anil (Lapsed Shopper - 35 days absent)",
-            "🛒 Vikram (Occasional Shopper - 2 visits/month)",
-            "📍 Sneha (Outside Geofence - 2.5 km away)"
-        ]
+with col_left:
+    st.subheader("1. Ingest Transaction History")
+    input_source = st.radio(
+        "Source of Payment Records:",
+        ["Synthesize Live Bank/UPI Statement", "Upload Custom Transaction CSV"]
     )
-    
-    presets = {
-        "🥛 Ramesh Uncle (Daily Morning Regular - 22 visits)": {"visits": 22, "days": 1, "dist": 0.2},
-        "🚶 Priya (New Resident to Area - 0 visits)": {"visits": 0, "days": 999, "dist": 0.1},
-        "😴 Anil (Lapsed Shopper - 35 days absent)": {"visits": 3, "days": 35, "dist": 0.4},
-        "🛒 Vikram (Occasional Shopper - 2 visits/month)": {"visits": 2, "days": 8, "dist": 0.3},
-        "📍 Sneha (Outside Geofence - 2.5 km away)": {"visits": 0, "days": 999, "dist": 2.5}
-    }
-    
-    if st.button("Evaluate Persona", type="primary"):
-        data = presets[persona]
-        res = run_engine(data["visits"], data["days"], data["dist"])
-        
-        c1, c2 = st.columns(2)
-        c1.metric("Classified Segment", res["segment"])
-        c2.metric("Coupon Issued", f"₹{res['val']}")
-        
-        if res["issue"]:
-            st.success(f"🎉 **Coupon Issued!** {res['reason']}")
-            st.info(f"🛒 **Minimum Basket Required:** ₹{res['min_basket']} (Protects merchant gross margin)")
-        else:
-            st.error(f"🛑 **Coupon Suppressed!** {res['reason']}")
-            st.warning("💰 **Merchant Margin Saved:** ₹25.00")
-            
-        st.caption(f"Calculated Habit Score: `{res['habit_score']} / 1.0`")
 
-# --- TAB 2: INTERACTIVE CUSTOM SLIDERS ---
-with tab2:
-    st.subheader("Step 2: Simulate Any Arbitrary Shopper")
-    st.write("Adjust the parameters to watch the decision engine react in real time:")
-    
-    custom_visits = st.slider("Past Visits in Last 30 Days:", min_value=0, max_value=30, value=1)
-    custom_days = st.slider("Days Since Last Visit:", min_value=1, max_value=60, value=7)
-    custom_dist = st.slider("Distance to Store (km):", min_value=0.1, max_value=4.0, value=0.4, step=0.1)
-    
-    if st.button("Run Engine on Custom Input"):
-        res = run_engine(custom_visits, custom_days, custom_dist)
-        
-        c1, c2 = st.columns(2)
-        c1.metric("Segment", res["segment"])
-        c2.metric("Coupon Value", f"₹{res['val']}")
-        
-        if res["issue"]:
-            st.success(f"🎉 **Issued!** {res['reason']}")
-            st.info(f"🛒 **Minimum Basket:** ₹{res['min_basket']}")
-        else:
-            st.error(f"🛑 **Blocked!** {res['reason']}")
-            st.warning("💰 **Margin Saved:** ₹25.00")
-            
-        st.caption(f"Calculated Habit Score: `{res['habit_score']} / 1.0`")
+    df_transactions = pd.DataFrame()
 
-# --- TAB 3: 1,000 CUSTOMER MONTE CARLO SIMULATOR ---
-with tab3:
-    st.subheader("Step 3: Monte Carlo Simulation (1,000 Customers)")
-    st.write("Simulate an entire month of neighborhood footfall: **Old Blind Engine vs. Paytm Nudge Engine**.")
-    
-    if st.button("Run 1,000-Customer Simulation", type="primary"):
-        num_customers = 1000
-        flat_coupon = 20.0
-        
-        # 1. Generate 1,000 synthetic neighborhood shoppers
-        customers = []
-        for _ in range(num_customers):
-            p = random.random()
-            if p < 0.55:
-                profile = "habitual"
-                p_organic, p_coupon = 0.95, 0.98
-            elif p < 0.80:
-                profile = "occasional"
-                p_organic, p_coupon = 0.25, 0.55
-            elif p < 0.90:
-                profile = "lapsed"
-                p_organic, p_coupon = 0.05, 0.35
-            else:
-                profile = "new"
-                p_organic, p_coupon = 0.02, 0.40
-            customers.append({"profile": profile, "p_org": p_organic, "p_coup": p_coupon})
-        
-        # 2. Run Old Blind Engine
-        old_spend = num_customers * flat_coupon
-        old_wasted = sum(flat_coupon for c in customers if c["profile"] == "habitual")
-        old_acquired = sum(1 for c in customers if c["profile"] in ["new", "lapsed"] and random.random() < c["p_coup"])
-        
-        # 3. Run Paytm Nudge Engine
-        smart_spend = 0.0
-        smart_wasted = 0.0
-        smart_acquired = 0
-        for c in customers:
-            if random.random() < 0.10:  # 10% Holdout Control Group
-                continue
-            if c["profile"] == "habitual":
-                coupon = 0.0
-                visited = random.random() < c["p_org"]
-            elif c["profile"] == "occasional":
-                coupon = 12.0
-                visited = random.random() < c["p_coup"]
-            elif c["profile"] == "lapsed":
-                coupon = 15.0
-                visited = random.random() < c["p_coup"]
-            else:  # New
-                coupon = 20.0
-                visited = random.random() < c["p_coup"]
-                
-            smart_spend += coupon
-            if visited and c["profile"] in ["new", "lapsed"]:
-                smart_acquired += 1
-                
-        old_cac = old_spend / max(old_acquired, 1)
-        smart_cac = smart_spend / max(smart_acquired, 1)
-        
-        # 4. Display Results Table & Metrics
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Budget Spent", f"₹{smart_spend:,.0f}", delta=f"-₹{old_spend - smart_spend:,.0f} Saved", delta_color="normal")
-        col2.metric("Wasted on Regulars", f"₹{smart_wasted:,.0f}", delta=f"-₹{old_wasted:,.0f} Eliminated", delta_color="normal")
-        col3.metric("Cost Per Acquisition", f"₹{smart_cac:.1f}", delta=f"-₹{old_cac - smart_cac:.1f} Cheaper", delta_color="normal")
-        
-        efficiency_multiplier = old_cac / max(smart_cac, 1)
-        st.success(f"🎯 **Acquisition Efficiency Gain:** Acquired new and lapsed customers **{efficiency_multiplier:.1f}x cheaper** compared to the old engine!")
-        
-        # Summary Data Table
-        st.table({
-            "Metric": [
-                "Total Budget Spent",
-                "Cashback Wasted on Regulars",
-                "New / Lapsed Customers Won",
-                "Cost per Acquired Customer"
-            ],
-            "Old Engine": [
-                f"₹{old_spend:,.0f}",
-                f"₹{old_wasted:,.0f}",
-                f"{old_acquired}",
-                f"₹{old_cac:.1f}"
-            ],
-            "Paytm Nudge Engine": [
-                f"₹{smart_spend:,.0f}",
-                f"₹{smart_wasted:,.0f}",
-                f"{smart_acquired}",
-                f"₹{smart_cac:.1f}"
+    if input_source == "Synthesize Live Bank/UPI Statement":
+        profile_choice = st.selectbox(
+            "Select Real-World Profile Behavior:",
+            [
+                "Frequent Morning Buyer (Milk & Bread Regular)",
+                "Occasional Evening Shopper (1-2 Visits/Month)",
+                "Lapsed Customer (No Visits in 30+ Days)",
+                "New User (Never transacted at this store)"
             ]
-        })
+        )
+        mapping = {
+            "Frequent Morning Buyer (Milk & Bread Regular)": "Frequent Morning Buyer",
+            "Occasional Evening Shopper (1-2 Visits/Month)": "Occasional Evening Shopper",
+            "Lapsed Customer (No Visits in 30+ Days)": "Lapsed Customer",
+            "New User (Never transacted at this store)": "New User"
+        }
+        df_transactions = generate_sample_statement(mapping[profile_choice])
+    else:
+        uploaded_file = st.file_uploader("Upload CSV (columns: timestamp, store_id, amount)", type=["csv"])
+        if uploaded_file is not None:
+            df_transactions = pd.read_csv(uploaded_file)
+        else:
+            st.info("Upload a CSV or use the live statement generator above.")
+
+    st.write("📍 **Customer Live Location:**")
+    user_distance = st.slider("Current Distance to Merchant (km):", min_value=0.1, max_value=3.5, value=0.3, step=0.1)
+
+    with st.expander("🔍 View Raw Ingested Statements", expanded=False):
+        if not df_transactions.empty:
+            st.dataframe(df_transactions, use_container_width=True)
+        else:
+            st.write("No transaction history detected.")
+
+with col_right:
+    st.subheader("2. AI Analysis & Coupon Verdict")
+    
+    if st.button("Analyze Statement & Evaluate Coupon", type="primary"):
+        # Run AI Feature Extraction
+        signals = ai_parse_transactions(df_transactions, STORE_CONFIG["store_id"])
+        
+        st.markdown("#### **AI Behavioral Extraction**")
+        st.info(f"🤖 **Engine Observation:** {signals['ai_summary']}")
+        
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Visits (30d)", signals["visits_30d"])
+        m2.metric("Days Since Last", f"{signals['days_since_last']} days" if signals['days_since_last'] is not None else "None")
+        m3.metric("Regularity Index", f"{signals['regularity']}")
+
+        st.divider()
+
+        # Run 5-Gate Coupon Decision
+        verdict = run_coupon_decision(signals, user_distance)
+
+        st.markdown("#### **Final Issuance Verdict**")
+        c1, c2 = st.columns(2)
+        c1.metric("Classified Segment", verdict["segment"])
+        c2.metric("Coupon Value", f"₹{verdict['val']}")
+
+        if verdict["issue"]:
+            st.success(f"🎉 **Coupon Issued!** {verdict['reason']}")
+            st.warning(f"🛒 **Required Dynamic Basket:** ₹{verdict['min_basket']} (Guarantees merchant margin preservation)")
+        else:
+            st.error(f"🛑 **Coupon Suppressed!** {verdict['reason']}")
+            st.info(f"💰 **Rupees Preserved for Merchant:** ₹25.00")
+
+        st.caption(f"Calculated Habit Score: `{verdict['habit_score']} / 1.0`")
